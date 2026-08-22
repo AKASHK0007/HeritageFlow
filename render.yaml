@@ -1,19 +1,19 @@
 services:
+  # Backend FastAPI Microservice
   - type: web
     name: heritageflow-backend
     env: docker
-    rootDir: backend
-    dockerfilePath: Dockerfile.backend
-    region: oregon
+    dockerContext: ./backend
+    dockerfilePath: ./backend/Dockerfile.backend
     plan: free
     healthCheckPath: /health
 
+  # Frontend Streamlit Microservice
   - type: web
     name: heritageflow-frontend
     env: docker
-    rootDir: frontend
-    dockerfilePath: Dockerfile.frontend
-    region: oregon
+    dockerContext: ./frontend
+    dockerfilePath: ./frontend/Dockerfile.frontend
     plan: free
     envVars:
       - key: API_URL
