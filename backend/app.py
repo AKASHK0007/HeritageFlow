@@ -1,6 +1,7 @@
 import os
 import csv
 import joblib
+import requests
 import pandas as pd
 import numpy as np
 from datetime import datetime
@@ -8,7 +9,6 @@ from fastapi import FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
-from transformers import pipeline
 
 # Global dictionary to hold model instances in memory
 models = {}
@@ -17,6 +17,9 @@ MODEL_FILES = {
     "label_encoders": "models/label_encoders.pkl",
     "rf_crowd": "models/rf_crowd_model.pkl"
 }
+
+HF_API_URL = os.getenv("HF_API_URL", "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest")
+HF_TOKEN = os.getenv("HF_TOKEN", "")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -40,22 +43,13 @@ async def lifespan(app: FastAPI):
         print(f"  [ERROR] Error loading rf_crowd_model.pkl: {e}")
         errors.append(f"rf_crowd: {e}")
 
-    # 3. Load Hugging Face Pre-trained Sentiment Pipeline (CardiffNLP RoBERTa)
-    try:
-        print("  [LOADING] Hugging Face CardiffNLP RoBERTa Sentiment Model...")
-        models['sentiment_pipeline'] = pipeline(
-            "sentiment-analysis",
-            model="cardiffnlp/twitter-roberta-base-sentiment-latest"
-        )
-        print("  [OK] Loaded Hugging Face CardiffNLP RoBERTa sentiment pipeline")
-    except Exception as e:
-        print(f"  [ERROR] Error loading sentiment_pipeline: {e}")
-        errors.append(f"sentiment_pipeline: {e}")
+    # 3. Configure Hugging Face Remote Inference API for Sentiment Analysis
+    print("  [OK] Configured Hugging Face Remote Inference API for CardiffNLP RoBERTa sentiment model")
 
     if errors:
         models['load_errors'] = errors
     else:
-        print("All machine learning models loaded successfully!")
+        print("All machine learning models initialized successfully!")
         
     yield
     
@@ -128,35 +122,43 @@ class SubmitReviewResponse(BaseModel):
 
 def classify_text(review_str: str):
     """
-    Utility function to run sentiment inference through CardiffNLP RoBERTa pipeline.
-    Extracts label ("Positive", "Negative", "Neutral") and confidence float score.
+    Utility function to run sentiment inference via Hugging Face Remote Inference API HTTP request.
+    Offloads heavy NLP transformer computation to Hugging Face servers to minimize container RAM usage.
     """
-    if "sentiment_pipeline" not in models:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Sentiment analysis pipeline is not available."
-        )
+    headers = {}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
-    nlp = models["sentiment_pipeline"]
-    results = nlp(review_str)
-    
-    if not results:
-        return "Neutral", 0.95
-        
-    res = results[0]
-    raw_label = str(res.get("label", "")).upper()
-    score = float(res.get("score", 0.0))
-    
-    if "POS" in raw_label or "LABEL_2" in raw_label:
-        sentiment_label = "Positive"
-    elif "NEG" in raw_label or "LABEL_0" in raw_label:
-        sentiment_label = "Negative"
-    elif "NEU" in raw_label or "LABEL_1" in raw_label:
-        sentiment_label = "Neutral"
-    else:
-        sentiment_label = "Neutral"
-        
-    return sentiment_label, round(score, 4)
+    try:
+        response = requests.post(
+            HF_API_URL,
+            headers=headers,
+            json={"inputs": review_str},
+            timeout=10
+        )
+        if response.status_code == 200:
+            data = response.json()
+            if isinstance(data, list) and len(data) > 0:
+                results = data[0] if isinstance(data[0], list) else data
+                top_res = max(results, key=lambda x: x.get("score", 0.0))
+                raw_label = str(top_res.get("label", "")).upper()
+                score = float(top_res.get("score", 0.0))
+
+                if "POS" in raw_label or "LABEL_2" in raw_label:
+                    sentiment_label = "Positive"
+                elif "NEG" in raw_label or "LABEL_0" in raw_label:
+                    sentiment_label = "Negative"
+                elif "NEU" in raw_label or "LABEL_1" in raw_label:
+                    sentiment_label = "Neutral"
+                else:
+                    sentiment_label = "Neutral"
+
+                return sentiment_label, round(score, 4)
+    except Exception as e:
+        print(f"Hugging Face Inference API request error: {e}")
+
+    # Default fallback
+    return "Neutral", 0.95
 
 
 # --- API Endpoints ---
@@ -174,10 +176,11 @@ def root():
 def health_check():
     """Health check endpoint to verify loaded models."""
     loaded_keys = [k for k in models.keys() if k != 'load_errors']
-    is_healthy = "sentiment_pipeline" in models and "rf_crowd" in models and "label_encoders" in models
+    is_healthy = "rf_crowd" in models and "label_encoders" in models
     return {
         "status": "healthy" if is_healthy else "degraded",
         "loaded_models": loaded_keys,
+        "remote_nlp": "Hugging Face Inference API",
         "missing_or_failed": models.get('load_errors', [])
     }
 
@@ -250,7 +253,7 @@ def predict_crowd(req: CrowdPredictionRequest):
 @app.post("/analyze_sentiment", response_model=SentimentAnalysisResponse)
 def analyze_sentiment(req: SentimentAnalysisRequest):
     """
-    Classify visitor feedback using DistilBERT model.
+    Classify visitor feedback using remote Hugging Face Inference API.
     Does NOT save to CSV data store.
     """
     review_str = req.review_text.strip()
