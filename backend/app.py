@@ -170,8 +170,15 @@ class SentimentAnalysisResponse(BaseModel):
 class SubmitReviewRequest(BaseModel):
     site_name: str = Field(default="Heritage Site", description="Heritage site name")
     review_text: str = Field(..., min_length=1, description="Visitor feedback review text")
-    sentiment: str = Field(default=None, description="Predicted sentiment class (optional)")
-    confidence: float = Field(default=None, ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0 (optional)")
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "site_name": "Lingaraj Temple",
+                "review_text": "Absolutely beautiful architecture and peaceful environment!"
+            }
+        }
+    }
 
 
 class SubmitReviewResponse(BaseModel):
@@ -185,42 +192,63 @@ class SubmitReviewResponse(BaseModel):
 def query_huggingface(review_str: str):
     """
     Utility function to run sentiment inference via Hugging Face Remote Inference API HTTP request.
-    Offloads heavy NLP transformer computation to Hugging Face servers to minimize container RAM usage.
+    Features robust connection retries, alternative endpoint fallback, and clean error messages.
     """
     headers = {}
     if HF_TOKEN:
         headers["Authorization"] = f"Bearer {HF_TOKEN}"
 
-    try:
-        response = requests.post(
-            HF_API_URL,
-            headers=headers,
-            json={"inputs": review_str},
-            timeout=10
-        )
-        if response.status_code == 200:
-            data = response.json()
-            if isinstance(data, list) and len(data) > 0:
-                results = data[0] if isinstance(data[0], list) else data
-                top_res = max(results, key=lambda x: x.get("score", 0.0))
-                raw_label = str(top_res.get("label", "")).upper()
-                score = float(top_res.get("score", 0.0))
+    endpoints = [
+        HF_API_URL,
+        "https://router.huggingface.co/hf-inference/models/cardiffnlp/twitter-roberta-base-sentiment-latest"
+    ]
+    # Remove duplicates while preserving order
+    endpoints = list(dict.fromkeys(endpoints))
 
-                if "POS" in raw_label or "LABEL_2" in raw_label:
-                    sentiment_label = "Positive"
-                elif "NEG" in raw_label or "LABEL_0" in raw_label:
-                    sentiment_label = "Negative"
-                elif "NEU" in raw_label or "LABEL_1" in raw_label:
-                    sentiment_label = "Neutral"
-                else:
-                    sentiment_label = "Neutral"
+    last_error = None
+    for endpoint in endpoints:
+        try:
+            response = requests.post(
+                endpoint,
+                headers=headers,
+                json={"inputs": review_str},
+                timeout=8
+            )
+            if response.status_code == 200:
+                data = response.json()
+                if isinstance(data, list) and len(data) > 0:
+                    results = data[0] if isinstance(data[0], list) else data
+                    top_res = max(results, key=lambda x: x.get("score", 0.0))
+                    raw_label = str(top_res.get("label", "")).upper()
+                    score = float(top_res.get("score", 0.0))
 
-                return sentiment_label, round(score, 4)
-    except Exception as e:
-        print(f"Hugging Face Inference API request error: {e}")
+                    if "POS" in raw_label or "LABEL_2" in raw_label:
+                        sentiment_label = "Positive"
+                    elif "NEG" in raw_label or "LABEL_0" in raw_label:
+                        sentiment_label = "Negative"
+                    elif "NEU" in raw_label or "LABEL_1" in raw_label:
+                        sentiment_label = "Neutral"
+                    else:
+                        sentiment_label = raw_label.title()
 
-    # Default fallback
-    return "Neutral", 0.95
+                    return sentiment_label, round(score, 4)
+            elif response.status_code in (401, 403):
+                last_error = "Hugging Face API Authentication required. Set a free HF_TOKEN environment variable (from huggingface.co/settings/tokens)."
+            elif response.status_code == 503:
+                last_error = "Hugging Face model is currently warming up/loading. Please retry in a few seconds."
+            else:
+                last_error = f"Hugging Face API returned HTTP {response.status_code}."
+        except requests.exceptions.ConnectionError:
+            last_error = "Network/DNS connection failed. Please check internet connection or host DNS settings."
+        except requests.exceptions.Timeout:
+            last_error = "Hugging Face API request timed out."
+        except Exception as e:
+            last_error = str(e)
+
+    raise HTTPException(
+        status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+        detail=f"{last_error}"
+    )
 
 
 # Alias for backward compatibility
@@ -347,6 +375,7 @@ def analyze_sentiment(req: SentimentAnalysisRequest):
 def submit_review(req: SubmitReviewRequest, db: Session = Depends(get_db)):
     """
     Persist official visitor review, timestamp, sentiment, and confidence to PostgreSQL / SQLAlchemy database.
+    Enforces server-side AI inference via Hugging Face.
     """
     review_str = req.review_text.strip()
     if not review_str:
@@ -355,14 +384,8 @@ def submit_review(req: SubmitReviewRequest, db: Session = Depends(get_db)):
             detail="Review text cannot be empty."
         )
 
-    if req.sentiment and req.confidence is not None:
-        sentiment_val = req.sentiment
-        confidence_val = req.confidence
-    else:
-        try:
-            sentiment_val, confidence_val = query_huggingface(review_str)
-        except Exception:
-            sentiment_val, confidence_val = "Neutral", 0.95
+    # Server-side AI inference via Hugging Face API (strict: raises HTTPException on failure)
+    sentiment_val, confidence_val = query_huggingface(review_str)
 
     try:
         new_review = Review(
