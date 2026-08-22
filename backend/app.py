@@ -1,16 +1,65 @@
 import os
-import csv
 import joblib
 import requests
 import pandas as pd
 import numpy as np
-from datetime import datetime
-from fastapi import FastAPI, HTTPException, status
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from datetime import datetime, timezone
 from contextlib import asynccontextmanager
 
-# Global dictionary to hold model instances in memory
+from fastapi import FastAPI, HTTPException, status, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime
+from sqlalchemy.orm import declarative_base, sessionmaker, Session
+
+# --- Database Setup & Configuration ---
+raw_db_url = os.getenv("DATABASE_URL", "sqlite:///./heritage.db")
+
+# Fix Render PostgreSQL URL format if needed (postgres:// -> postgresql://)
+if raw_db_url.startswith("postgres://"):
+    raw_db_url = raw_db_url.replace("postgres://", "postgresql://", 1)
+
+connect_args = {"check_same_thread": False} if raw_db_url.startswith("sqlite") else {}
+engine = create_engine(raw_db_url, connect_args=connect_args)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+
+# --- Database Models ---
+
+class Review(Base):
+    __tablename__ = "reviews"
+
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    site_name = Column(String, nullable=True)
+    review_text = Column(String, nullable=False)
+    sentiment = Column(String, nullable=False)
+    confidence = Column(Float, nullable=False)
+    timestamp = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+
+    def to_dict(self):
+        return {
+            "id": self.id,
+            "site_name": self.site_name,
+            "review_text": self.review_text,
+            "sentiment": self.sentiment,
+            "confidence": self.confidence,
+            "timestamp": self.timestamp.isoformat() if self.timestamp else None
+        }
+
+
+# --- Database Dependency ---
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# Global dictionary to hold ML model instances in memory
 models = {}
 
 MODEL_FILES = {
@@ -21,13 +70,22 @@ MODEL_FILES = {
 HF_API_URL = os.getenv("HF_API_URL", "https://api-inference.huggingface.co/models/cardiffnlp/twitter-roberta-base-sentiment-latest")
 HF_TOKEN = os.getenv("HF_TOKEN", "")
 
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Lifespan event handler to load ML models at startup safely."""
+    """Lifespan event handler to create DB tables & load ML models safely."""
     errors = []
     print("Starting up HeritageFlow FastAPI server...")
     
-    # 1. Load label encoders
+    # 1. Initialize Database Tables
+    try:
+        Base.metadata.create_all(bind=engine)
+        print("  [OK] Database tables initialized successfully")
+    except Exception as e:
+        print(f"  [ERROR] Error initializing database tables: {e}")
+        errors.append(f"database: {e}")
+
+    # 2. Load label encoders
     try:
         models['label_encoders'] = joblib.load(MODEL_FILES['label_encoders'])
         print("  [OK] Loaded label_encoders.pkl")
@@ -35,7 +93,7 @@ async def lifespan(app: FastAPI):
         print(f"  [ERROR] Error loading label_encoders.pkl: {e}")
         errors.append(f"label_encoders: {e}")
 
-    # 2. Load Random Forest model
+    # 3. Load Random Forest model
     try:
         models['rf_crowd'] = joblib.load(MODEL_FILES['rf_crowd'])
         print("  [OK] Loaded rf_crowd_model.pkl")
@@ -43,18 +101,19 @@ async def lifespan(app: FastAPI):
         print(f"  [ERROR] Error loading rf_crowd_model.pkl: {e}")
         errors.append(f"rf_crowd: {e}")
 
-    # 3. Configure Hugging Face Remote Inference API for Sentiment Analysis
-    print("  [OK] Configured Hugging Face Remote Inference API for CardiffNLP RoBERTa sentiment model")
+    # 4. Configure Hugging Face Remote Inference API
+    print("  [OK] Configured Hugging Face Remote Inference API for CardiffNLP RoBERTa model")
 
     if errors:
         models['load_errors'] = errors
     else:
-        print("All machine learning models initialized successfully!")
+        print("All backend services and models initialized successfully!")
         
     yield
     
     models.clear()
     print("Shutting down HeritageFlow FastAPI server...")
+
 
 app = FastAPI(
     title="HeritageFlow Smart City Analytics API",
@@ -108,6 +167,7 @@ class SentimentAnalysisResponse(BaseModel):
 
 
 class SubmitReviewRequest(BaseModel):
+    site_name: str = Field(default="Heritage Site", description="Heritage site name")
     review_text: str = Field(..., min_length=1, description="Visitor feedback review text")
     sentiment: str = Field(default=None, description="Predicted sentiment class (optional)")
     confidence: float = Field(default=None, ge=0.0, le=1.0, description="Confidence score between 0.0 and 1.0 (optional)")
@@ -116,11 +176,12 @@ class SubmitReviewRequest(BaseModel):
 class SubmitReviewResponse(BaseModel):
     status: str = "success"
     message: str = "Review submitted successfully."
+    record: dict = Field(..., description="Saved review record")
 
 
 # --- Inference Helper Function ---
 
-def classify_text(review_str: str):
+def query_huggingface(review_str: str):
     """
     Utility function to run sentiment inference via Hugging Face Remote Inference API HTTP request.
     Offloads heavy NLP transformer computation to Hugging Face servers to minimize container RAM usage.
@@ -161,6 +222,10 @@ def classify_text(review_str: str):
     return "Neutral", 0.95
 
 
+# Alias for backward compatibility
+classify_text = query_huggingface
+
+
 # --- API Endpoints ---
 
 @app.get("/")
@@ -168,19 +233,20 @@ def root():
     return {
         "platform": "HeritageFlow Smart City Platform",
         "status": "online",
-        "endpoints": ["/predict_crowd", "/analyze_sentiment", "/submit_review", "/health"]
+        "endpoints": ["/predict_crowd", "/analyze_sentiment", "/submit-review", "/get-reviews", "/health"]
     }
 
 
 @app.get("/health")
 def health_check():
-    """Health check endpoint to verify loaded models."""
+    """Health check endpoint to verify backend services and models."""
     loaded_keys = [k for k in models.keys() if k != 'load_errors']
     is_healthy = "rf_crowd" in models and "label_encoders" in models
     return {
         "status": "healthy" if is_healthy else "degraded",
         "loaded_models": loaded_keys,
         "remote_nlp": "Hugging Face Inference API",
+        "database": "connected",
         "missing_or_failed": models.get('load_errors', [])
     }
 
@@ -227,8 +293,6 @@ def predict_crowd(req: CrowdPredictionRequest):
             detail=f"Unknown Time_Slot '{req.time_slot}'. Valid options: {known}"
         )
 
-    # Feature ordering must match model training format:
-    # ['Is_Weekend', 'Is_Festival', 'Checkpoint', 'Weather', 'Temperature_C', 'Time_Slot']
     features_df = pd.DataFrame([{
         'Is_Weekend': req.is_weekend,
         'Is_Festival': req.is_festival,
@@ -240,7 +304,6 @@ def predict_crowd(req: CrowdPredictionRequest):
 
     try:
         pred_value = rf_model.predict(features_df)[0]
-        # Crowd density cannot be negative
         final_crowd = max(0.0, round(float(pred_value), 2))
         return CrowdPredictionResponse(predicted_crowd_density=final_crowd)
     except Exception as e:
@@ -254,7 +317,7 @@ def predict_crowd(req: CrowdPredictionRequest):
 def analyze_sentiment(req: SentimentAnalysisRequest):
     """
     Classify visitor feedback using remote Hugging Face Inference API.
-    Does NOT save to CSV data store.
+    Does NOT save to database store.
     """
     review_str = req.review_text.strip()
     if not review_str:
@@ -264,7 +327,7 @@ def analyze_sentiment(req: SentimentAnalysisRequest):
         )
 
     try:
-        sentiment_label, confidence = classify_text(review_str)
+        sentiment_label, confidence = query_huggingface(review_str)
         return SentimentAnalysisResponse(
             sentiment=sentiment_label,
             confidence=confidence
@@ -278,10 +341,11 @@ def analyze_sentiment(req: SentimentAnalysisRequest):
         )
 
 
-@app.post("/submit_review", response_model=SubmitReviewResponse)
-def submit_review(req: SubmitReviewRequest):
+@app.post("/submit-review")
+@app.post("/submit_review")
+def submit_review(req: SubmitReviewRequest, db: Session = Depends(get_db)):
     """
-    Persist official visitor review, timestamp, sentiment, and confidence to heritage_tourist_reviews.csv.
+    Persist official visitor review, timestamp, sentiment, and confidence to PostgreSQL / SQLAlchemy database.
     """
     review_str = req.review_text.strip()
     if not review_str:
@@ -295,25 +359,44 @@ def submit_review(req: SubmitReviewRequest):
         confidence_val = req.confidence
     else:
         try:
-            sentiment_val, confidence_val = classify_text(review_str)
+            sentiment_val, confidence_val = query_huggingface(review_str)
         except Exception:
             sentiment_val, confidence_val = "Neutral", 0.95
 
-    current_time_str = datetime.now().strftime("%Y-%m-%d %H:%M")
-    conf_pct_str = f"{confidence_val * 100:.1f}%"
-    csv_file = "data/heritage_tourist_reviews.csv"
-    file_exists = os.path.exists(csv_file)
-
     try:
-        os.makedirs(os.path.dirname(csv_file), exist_ok=True)
-        with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
-            writer = csv.writer(f)
-            if not file_exists or os.path.getsize(csv_file) == 0:
-                writer.writerow(["Date & Time", "Visitor Review", "Sentiment", "Confidence"])
-            writer.writerow([current_time_str, review_str, sentiment_val, conf_pct_str])
-        return SubmitReviewResponse(status="success", message="Review submitted and saved to database.")
+        new_review = Review(
+            site_name=req.site_name,
+            review_text=review_str,
+            sentiment=sentiment_val,
+            confidence=confidence_val
+        )
+        db.add(new_review)
+        db.commit()
+        db.refresh(new_review)
+        return {
+            "status": "success",
+            "message": "Review submitted and saved to database.",
+            "record": new_review.to_dict()
+        }
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to save review to database: {e}"
+        )
+
+
+@app.get("/get-reviews")
+@app.get("/get_reviews")
+def get_reviews(db: Session = Depends(get_db)):
+    """
+    Query and return all visitor reviews from database.
+    """
+    try:
+        reviews = db.query(Review).all()
+        return [r.to_dict() for r in reviews]
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to submit review to database: {e}"
+            detail=f"Failed to fetch reviews from database: {e}"
         )
