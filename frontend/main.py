@@ -15,7 +15,7 @@ st.set_page_config(
 )
 
 # --- API Backend Base URL ---
-BACKEND_URL = "http://127.0.0.1:8000"
+API_URL = os.getenv("API_URL", "http://backend:8000")
 
 # --- Sidebar Inputs for Crowd Prediction ---
 st.sidebar.title("⚙️ Control Panel")
@@ -53,14 +53,14 @@ st.divider()
 # Check API health
 api_online = False
 try:
-    health_resp = requests.get(f"{BACKEND_URL}/health", timeout=2)
+    health_resp = requests.get(f"{API_URL}/health", timeout=2)
     if health_resp.status_code == 200 and health_resp.json().get("status") == "healthy":
         api_online = True
 except Exception:
     api_online = False
 
 if not api_online:
-    st.error("⚠️ **FastAPI Backend Offline**: Unable to connect to `http://127.0.0.1:8000`. Please ensure the backend server is running via `uvicorn main:app --reload`.")
+    st.error(f"⚠️ **FastAPI Backend Offline**: Unable to connect to `{API_URL}`. Please ensure the backend server is running via `uvicorn app:app --reload`.")
 
 # --- Row 1: Real-Time Crowd Prediction ---
 st.header("📊 Live Crowd Density Prediction")
@@ -80,7 +80,7 @@ error_msg = None
 
 if api_online:
     try:
-        res = requests.post(f"{BACKEND_URL}/predict_crowd", json=crowd_payload, timeout=5)
+        res = requests.post(f"{API_URL}/predict_crowd", json=crowd_payload, timeout=5)
         if res.status_code == 200:
             predicted_density = res.json().get("predicted_crowd_density")
         else:
@@ -146,7 +146,7 @@ def handle_submit():
 
     try:
         s_resp = requests.post(
-            f"{BACKEND_URL}/analyze_sentiment",
+            f"{API_URL}/analyze_sentiment",
             json={"review_text": target_text},
             timeout=5
         )
@@ -159,7 +159,7 @@ def handle_submit():
             cur_confidence = res_data.get("confidence", 0.95)
             
             sub_resp = requests.post(
-                f"{BACKEND_URL}/submit_review",
+                f"{API_URL}/submit_review",
                 json={
                     "review_text": target_text,
                     "sentiment": cur_sentiment,
@@ -229,7 +229,7 @@ with col_result:
                 with st.spinner("Analyzing text with Deep Neural Network..."):
                     try:
                         s_resp = requests.post(
-                            f"{BACKEND_URL}/analyze_sentiment",
+                            f"{API_URL}/analyze_sentiment",
                             json={"review_text": target_text},
                             timeout=5
                         )
@@ -365,7 +365,7 @@ if os.path.exists(csv_file_path):
     except Exception as ex:
         st.error(f"Error loading recent feedback log: {ex}")
 else:
-    st.warning(f"File `{csv_file_path}` not found in root directory.")
+    st.warning(f"File `{csv_file_path}` not found.")
 
 
 # --- Row 4: Admin Panel - Full Database Access ---
@@ -412,5 +412,3 @@ with st.expander("🛠️ Admin Panel - Full Database Access"):
             st.error(f"Error rendering Admin Panel: {ex}")
     else:
         st.warning(f"Database file `{csv_file_path}` not available.")
-
-

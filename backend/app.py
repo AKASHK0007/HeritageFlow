@@ -302,6 +302,7 @@ def submit_review(req: SubmitReviewRequest):
     file_exists = os.path.exists(csv_file)
 
     try:
+        os.makedirs(os.path.dirname(csv_file), exist_ok=True)
         with open(csv_file, mode="a", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             if not file_exists or os.path.getsize(csv_file) == 0:
