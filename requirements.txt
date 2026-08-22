@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+streamlit
+pandas
+scikit-learn
+transformers
+torch
+tf-keras
+joblib
