@@ -17,11 +17,11 @@ An end-to-end Machine Learning & NLP intelligence platform designed for smart ci
 
 ```mermaid
 graph TD
-    User([Tourist / Heritage Admin]) --> UI[Streamlit Frontend Dashboard (app.py)]
-    UI -->|HTTP Requests| API[FastAPI Backend Server (main.py)]
-    API -->|Inference| RF[Random Forest Crowd Model (models/rf_crowd_model.pkl)]
-    API -->|Inference| NLP[RoBERTa Sentiment NLP (Hugging Face / PyTorch)]
-    API -->|Read / Write| CSV[Database Storage (data/heritage_tourist_reviews.csv)]
+    User(["Tourist / Heritage Admin"]) --> UI["Streamlit Frontend Dashboard (frontend/main.py)"]
+    UI -->|HTTP Requests| API["FastAPI Backend Server (backend/app.py)"]
+    API -->|Inference| RF["Random Forest Crowd Model (backend/models/rf_crowd_model.pkl)"]
+    API -->|API Call| NLP["Hugging Face Inference API (RoBERTa)"]
+    API -->|Read / Write| DB[("PostgreSQL Cloud Database (Render)")]
 ```
 
 ---
