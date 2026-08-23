@@ -123,6 +123,10 @@ app = FastAPI(
     lifespan=lifespan
 )
 
+@app.get("/")
+async def health_check():
+    return {"status": "Backend is live and running!"}
+
 # Enable CORS for Streamlit frontend interaction
 app.add_middleware(
     CORSMiddleware,
